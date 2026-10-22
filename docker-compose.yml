@@ -1,0 +1,137 @@
+name: data-modeling
+
+x-db-env: &db-env
+  TZ: Asia/Ho_Chi_Minh
+  OLTP_HOST: oltp-db
+  OLTP_DB: ${OLTP_DB:-shop_oltp}
+  OLTP_USER: ${OLTP_USER:-oltp}
+  OLTP_PASSWORD: ${OLTP_PASSWORD:-oltp}
+  DWH_HOST: dwh-db
+  DWH_DB: ${DWH_DB:-shop_dwh}
+  DWH_USER: ${DWH_USER:-dwh}
+  DWH_PASSWORD: ${DWH_PASSWORD:-dwh}
+
+x-spark: &spark
+  build: ./spark
+  image: data-modeling/spark:3.5.8
+  environment:
+    <<: *db-env
+    LAKE_PATH: /opt/lake
+  volumes:
+    - ./spark/jobs:/opt/spark-apps
+    - lake:/opt/lake
+
+services:
+  # ------------------------------------------------------------------ OLTP
+  oltp-db:
+    image: postgres:16
+    container_name: oltp-db
+    command: ["postgres", "-c", "timezone=Asia/Ho_Chi_Minh"]
+    environment:
+      TZ: Asia/Ho_Chi_Minh
+      POSTGRES_DB: ${OLTP_DB:-shop_oltp}
+      POSTGRES_USER: ${OLTP_USER:-oltp}
+      POSTGRES_PASSWORD: ${OLTP_PASSWORD:-oltp}
+    ports:
+      - "${OLTP_PORT:-5433}:5432"
+    volumes:
+      - ./oltp/init:/docker-entrypoint-initdb.d:ro
+      - oltp-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # ------------------------------------------------------------------ OLAP / DWH
+  dwh-db:
+    image: postgres:16
+    container_name: dwh-db
+    command: ["postgres", "-c", "timezone=Asia/Ho_Chi_Minh"]
+    environment:
+      TZ: Asia/Ho_Chi_Minh
+      POSTGRES_DB: ${DWH_DB:-shop_dwh}
+      POSTGRES_USER: ${DWH_USER:-dwh}
+      POSTGRES_PASSWORD: ${DWH_PASSWORD:-dwh}
+    ports:
+      - "${DWH_PORT:-5434}:5432"
+    volumes:
+      - ./dwh/init:/docker-entrypoint-initdb.d:ro
+      - ./sql:/sql:ro
+      - dwh-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # ------------------------------------------------------------------ Spark standalone cluster
+  spark-master:
+    <<: *spark
+    container_name: spark-master
+    hostname: spark-master
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master",
+              "--host", "spark-master", "--port", "7077", "--webui-port", "8080"]
+    ports:
+      - "${SPARK_MASTER_UI_PORT:-8080}:8080"
+      - "${SPARK_APP_UI_PORT:-4040}:4040"   # Spark UI of the running job (driver runs here)
+    depends_on:
+      oltp-db:
+        condition: service_healthy
+      dwh-db:
+        condition: service_healthy
+
+  spark-worker:
+    <<: *spark
+    container_name: spark-worker
+    hostname: spark-worker
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker",
+              "--host", "spark-worker", "--webui-port", "8081", "spark://spark-master:7077"]
+    environment:
+      <<: *db-env
+      LAKE_PATH: /opt/lake
+      SPARK_WORKER_CORES: ${SPARK_WORKER_CORES:-2}
+      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY:-1536m}
+    ports:
+      - "${SPARK_WORKER_UI_PORT:-8081}:8081"
+    depends_on:
+      - spark-master
+
+  # ------------------------------------------------------------------ Mock data generator (on demand)
+  datagen:
+    build: ./datagen
+    image: data-modeling/datagen:latest
+    profiles: ["tools"]
+    environment:
+      <<: *db-env
+      N_CUSTOMERS: ${N_CUSTOMERS:-5000}
+      N_PRODUCTS: ${N_PRODUCTS:-400}
+      N_ORDERS: ${N_ORDERS:-60000}
+      START_DATE: ${START_DATE:-2024-01-01}
+    volumes:
+      - ./datagen:/app
+    depends_on:
+      oltp-db:
+        condition: service_healthy
+
+  # ------------------------------------------------------------------ BI (optional)
+  metabase:
+    image: metabase/metabase:v0.56.9
+    container_name: metabase
+    profiles: ["bi"]
+    environment:
+      MB_DB_FILE: /metabase-data/metabase.db
+      JAVA_TIMEZONE: Asia/Ho_Chi_Minh
+    ports:
+      - "${METABASE_PORT:-3000}:3000"
+    volumes:
+      - metabase-data:/metabase-data
+    depends_on:
+      dwh-db:
+        condition: service_healthy
+
+volumes:
+  oltp-data:
+  dwh-data:
+  lake:
+  metabase-data:
